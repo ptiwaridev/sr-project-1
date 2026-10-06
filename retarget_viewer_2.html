@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>ASL Landmark Retargeting Viewer</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #1c1f24; font-family: system-ui, sans-serif; color: #eee; }
+  #ui {
+    position: absolute; top: 12px; left: 12px; z-index: 10;
+    background: rgba(20,22,26,0.9); padding: 14px 16px; border-radius: 8px;
+    display: flex; flex-direction: column; gap: 8px; max-width: 320px;
+  }
+  #ui label { font-size: 13px; }
+  #ui input[type="file"] { font-size: 12px; }
+  #ui button { padding: 6px 10px; cursor: pointer; }
+  #status { font-size: 12px; color: #9ad; white-space: pre-wrap; }
+  #frameInfo { font-size: 12px; color: #ccc; }
+  #scrubber { width: 100%; }
+</style>
+</head>
+<body>
+
+<div id="ui">
+  <label>1. Load your VRM avatar<br><input type="file" id="vrmInput" accept=".vrm" /></label>
+  <label>2. Load a landmark JSON (from extract_landmarks.py)<br><input type="file" id="landmarkInput" accept=".json" /></label>
+  <div>
+    <button id="playBtn" disabled>Play</button>
+    <button id="stepBtn" disabled>Step +1 frame</button>
+  </div>
+  <input type="range" id="scrubber" min="0" max="0" value="0" disabled />
+  <div id="frameInfo">No landmark data loaded</div>
+  <div id="status">Load a VRM file to begin.</div>
+</div>
+
+<script async src="https://cdn.jsdelivr.net/npm/es-module-shims@1.10.0/dist/es-module-shims.js"></script>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.162.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.162.0/examples/jsm/",
+    "@pixiv/three-vrm": "https://cdn.jsdelivr.net/npm/@pixiv/three-vrm@3/lib/three-vrm.module.js"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { VRMLoaderPlugin } from '@pixiv/three-vrm';
+
+// ---------------------------------------------------------------
+// Tuning constants. If the avatar's arm moves the wrong direction
+// or mirrored, flip these first before touching anything else.
+// ---------------------------------------------------------------
+const MIRROR_X = 1;
+const MIRROR_Y = 1;
+const MIRROR_Z = -1;
+
+// MediaPipe Pose landmark indices we need
+const POSE = {
+  leftShoulder: 11, rightShoulder: 12,
+  leftElbow: 13, rightElbow: 14,
+  leftWrist: 15, rightWrist: 16,
+};
+// MediaPipe Hand landmark indices
+const HAND = { wrist: 0, middleMcp: 9 };
+
+const statusEl = document.getElementById('status');
+const frameInfoEl = document.getElementById('frameInfo');
+const scrubberEl = document.getElementById('scrubber');
+const playBtn = document.getElementById('playBtn');
+const stepBtn = document.getElementById('stepBtn');
+
+function setStatus(msg) { statusEl.textContent = msg; }
+
+// ---------------------------------------------------------------
+// Three.js scene setup
+// ---------------------------------------------------------------
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x1c1f24);
+
+const camera = new THREE.PerspectiveCamera(35, window.innerWidth / window.innerHeight, 0.1, 20);
+camera.position.set(0, 1.4, 2.5);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 1.1, 0);
+controls.update();
+
+scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 1.2));
+const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+dirLight.position.set(1, 2, 1);
+scene.add(dirLight);
+
+const grid = new THREE.GridHelper(4, 16, 0x555555, 0x333333);
+scene.add(grid);
+
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+function animate() {
+  requestAnimationFrame(animate);
+  controls.update();
+  renderer.render(scene, camera);
+}
+animate();
+
+// ---------------------------------------------------------------
+// State
+// ---------------------------------------------------------------
+let currentVrm = null;
+let frames = [];        // parsed landmark frames
+let frameIndex = 0;
+let isPlaying = false;
+let restDirections = {}; // boneName -> THREE.Vector3 (local rest direction, captured at load)
+
+// ---------------------------------------------------------------
+// VRM loading
+// ---------------------------------------------------------------
+const gltfLoader = new GLTFLoader();
+gltfLoader.register((parser) => new VRMLoaderPlugin(parser));
+
+document.getElementById('vrmInput').addEventListener('change', (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  setStatus('Loading VRM...');
+
+  const reader = new FileReader();
+  reader.onload = () => {
+    gltfLoader.parse(
+      reader.result,
+      '',
+      (gltf) => {
+        if (currentVrm) scene.remove(currentVrm.scene);
+        currentVrm = gltf.userData.vrm;
+        scene.add(currentVrm.scene);
+        currentVrm.scene.rotation.y = Math.PI; // VRM faces +Z by convention; flip to face camera
+
+        captureRestDirections();
+        setStatus('VRM loaded. Now load a landmark JSON file.');
+        maybeEnableControls();
+      },
+      (err) => setStatus('Failed to load VRM: ' + err)
+    );
+  };
+  reader.readAsArrayBuffer(file);
+});
+
+// Capture each bone's rest-pose local direction toward its primary child,
+// BEFORE we ever rotate it. This is what later frames get aimed relative to.
+function captureRestDirections() {
+  restDirections = {};
+  const boneNames = ['rightUpperArm', 'rightLowerArm', 'rightHand', 'leftUpperArm', 'leftLowerArm', 'leftHand'];
+  const childOf = {
+    rightUpperArm: 'rightLowerArm', rightLowerArm: 'rightHand', rightHand: 'rightMiddleProximal',
+    leftUpperArm: 'leftLowerArm', leftLowerArm: 'leftHand', leftHand: 'leftMiddleProximal',
+  };
+  for (const name of boneNames) {
+    const bone = currentVrm.humanoid.getNormalizedBoneNode(name);
+    const childName = childOf[name];
+    const child = childName ? currentVrm.humanoid.getNormalizedBoneNode(childName) : null;
+    if (bone && child) {
+      restDirections[name] = child.position.clone().normalize();
+    }
+  }
+}
+
+// ---------------------------------------------------------------
+// Landmark JSON loading
+// ---------------------------------------------------------------
+document.getElementById('landmarkInput').addEventListener('change', (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    try {
+      frames = JSON.parse(reader.result);
+      frameIndex = 0;
+      scrubberEl.max = frames.length - 1;
+      scrubberEl.value = 0;
+      updateFrameInfo();
+      setStatus(`Loaded ${frames.length} frames.`);
+      maybeEnableControls();
+    } catch (err) {
+      setStatus('Failed to parse landmark JSON: ' + err);
+    }
+  };
+  reader.readAsText(file);
+});
+
+function maybeEnableControls() {
+  const ready = currentVrm && frames.length > 0;
+  playBtn.disabled = !ready;
+  stepBtn.disabled = !ready;
+  scrubberEl.disabled = !ready;
+  if (ready) applyFrame(frameIndex);
+}
+
+// ---------------------------------------------------------------
+// Retargeting math
+// ---------------------------------------------------------------
+function toThreeVec(lm) {
+  // MediaPipe: x right, y DOWN (image space), z roughly depth (negative = toward camera).
+  // Convert to a Three.js-friendly direction: flip y (down->up) and negate z.
+  return new THREE.Vector3(
+    (lm.x - 0.5) * MIRROR_X,
+    -(lm.y - 0.5) * MIRROR_Y,
+    -lm.z * MIRROR_Z
+  );
+}
+
+function aimBone(boneName, targetWorldDir) {
+  const bone = currentVrm.humanoid.getNormalizedBoneNode(boneName);
+  const restDir = restDirections[boneName];
+  if (!bone || !restDir || !targetWorldDir) return;
+
+  const parent = bone.parent;
+  const parentWorldQuat = new THREE.Quaternion();
+  parent.getWorldQuaternion(parentWorldQuat);
+
+  const localTargetDir = targetWorldDir.clone()
+    .applyQuaternion(parentWorldQuat.clone().invert())
+    .normalize();
+
+  bone.quaternion.setFromUnitVectors(restDir, localTargetDir);
+}
+
+function applyFrame(i) {
+  if (!currentVrm || !frames[i]) return;
+  const f = frames[i];
+
+  // Prefer whichever hand actually has data in this frame.
+  const side = f.right_hand ? 'right' : (f.left_hand ? 'left' : null);
+  if (side && f.pose) {
+    const shoulderIdx = side === 'right' ? POSE.rightShoulder : POSE.leftShoulder;
+    const elbowIdx = side === 'right' ? POSE.rightElbow : POSE.leftElbow;
+    const wristIdx = side === 'right' ? POSE.rightWrist : POSE.leftWrist;
+
+    const shoulder = toThreeVec(f.pose[shoulderIdx]);
+    const elbow = toThreeVec(f.pose[elbowIdx]);
+    const wrist = toThreeVec(f.pose[wristIdx]);
+
+    aimBone(side + 'UpperArm', elbow.clone().sub(shoulder).normalize());
+    aimBone(side + 'LowerArm', wrist.clone().sub(elbow).normalize());
+
+    const handLm = side === 'right' ? f.right_hand : f.left_hand;
+    if (handLm) {
+      const handWrist = toThreeVec(handLm[HAND.wrist]);
+      const handMcp = toThreeVec(handLm[HAND.middleMcp]);
+      aimBone(side + 'Hand', handMcp.clone().sub(handWrist).normalize());
+    }
+  }
+
+  currentVrm.update ? currentVrm.update(0) : null;
+  updateFrameInfo();
+}
+
+function updateFrameInfo() {
+  frameInfoEl.textContent = frames.length
+    ? `Frame ${frameIndex + 1} / ${frames.length}`
+    : 'No landmark data loaded';
+}
+
+// ---------------------------------------------------------------
+// Playback controls
+// ---------------------------------------------------------------
+scrubberEl.addEventListener('input', () => {
+  frameIndex = parseInt(scrubberEl.value, 10);
+  applyFrame(frameIndex);
+});
+
+stepBtn.addEventListener('click', () => {
+  frameIndex = (frameIndex + 1) % frames.length;
+  scrubberEl.value = frameIndex;
+  applyFrame(frameIndex);
+});
+
+playBtn.addEventListener('click', () => {
+  isPlaying = !isPlaying;
+  playBtn.textContent = isPlaying ? 'Pause' : 'Play';
+});
+
+setInterval(() => {
+  if (!isPlaying || frames.length === 0) return;
+  frameIndex = (frameIndex + 1) % frames.length;
+  scrubberEl.value = frameIndex;
+  applyFrame(frameIndex);
+}, 1000 / 30); // assumes ~30fps source clips
+</script>
+</body>
+</html>
